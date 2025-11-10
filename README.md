@@ -152,13 +152,9 @@ python GUIs/cut_and_drag.py
 - [x] Camera-control examples
 - [x] Cut-and-Drag GUI
 - [x] Cut-and-Drag GUI guide
+- [ ] Update arXiv link + Paper link + BibTeX
 - [ ] Evaluation code
 
-
-In the end:
-- [ ] Arxiv + Paper link and BibTeX
-- [ ] Delete git history (first save it in some other place), delete also things like pyc files
-- [ ] Make git public + add paper page
 
 ##  BibTeX
 ```
