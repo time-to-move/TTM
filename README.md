@@ -13,10 +13,10 @@
   <a href="https://time-to-move.github.io/">
     <img src="assets/logo_page.svg" alt="Project Page" width="125">
   </a>
-  <a href="https://arxiv.org/abs/xxxx.xxxxx">
+  <a href="https://arxiv.org/abs/2511.08633">
     <img src="assets/logo_arxiv.svg" alt="Arxiv" width="125">
   </a>
-  <a href="https://arxiv.org/abs/xxxx.xxxxx.pdf">
+  <a href="https://arxiv.org/pdf/2511.08633">
     <img src="assets/logo_paper.svg" alt="Paper" width="125">
   </a>
 </p>
@@ -152,10 +152,18 @@ python GUIs/cut_and_drag.py
 - [x] Camera-control examples
 - [x] Cut-and-Drag GUI
 - [x] Cut-and-Drag GUI guide
-- [ ] Update arXiv link + Paper link + BibTeX
 - [ ] Evaluation code
 
  
 ##  BibTeX
 ```
+@misc{singer2025timetomovetrainingfreemotioncontrolled,
+      title={Time-to-Move: Training-Free Motion Controlled Video Generation via Dual-Clock Denoising}, 
+      author={Assaf Singer and Noam Rotstein and Amir Mann and Ron Kimmel and Or Litany},
+      year={2025},
+      eprint={2511.08633},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2511.08633}, 
+}
 ```
