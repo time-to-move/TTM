@@ -127,10 +127,22 @@ def inpaint_background(image_bgr: np.ndarray, mask_bool: np.ndarray) -> np.ndarr
     mask = (mask_bool.astype(np.uint8) * 255)
     return cv2.inpaint(image_bgr, mask, 3, cv2.INPAINT_TELEA)
 
-def animate_polygon(image_bgr, polygon_xy, path_xy, scales, rotations_deg, interp=cv2.INTER_LINEAR, origin_xy=None):
+def animate_polygon(
+    image_bgr,
+    polygon_xy,
+    path_xy,
+    scales,
+    rotations_deg,
+    interp=cv2.INTER_LINEAR,
+    origin_xy=None,
+    alpha_mask=None,
+):
     """
     Returns list of RGBA frames and list of transformed polygons per frame.
     Uses BORDER_REPLICATE so off-canvas doesn't appear black.
+
+    If alpha_mask is provided (uint8 H×W), it is warped with the same transform
+    and AND-ed with the polygon mask to produce the per-frame alpha.
     """
     h, w = image_bgr.shape[:2]
     frames_rgba = []
@@ -143,25 +155,43 @@ def animate_polygon(image_bgr, polygon_xy, path_xy, scales, rotations_deg, inter
     else:
         origin = np.asarray(origin_xy, dtype=np.float32)
 
+    poly = np.asarray(polygon_xy, dtype=np.float32)
+    pts1 = np.hstack([poly, np.ones((len(poly), 1), dtype=np.float32)])
+
     for i in range(len(path_xy)):
         theta = np.deg2rad(rotations_deg[i]).astype(np.float32)
         s = float(scales[i])
+
         a11 = s * np.cos(theta); a12 = -s * np.sin(theta)
         a21 = s * np.sin(theta); a22 =  s * np.cos(theta)
         tx = path_xy[i, 0] - (a11 * origin[0] + a12 * origin[1])
         ty = path_xy[i, 1] - (a21 * origin[0] + a22 * origin[1])
         M = np.array([[a11, a12, tx], [a21, a22, ty]], dtype=np.float32)
 
-        warped = cv2.warpAffine(image_bgr, M, (w, h), flags=interp,
-                                borderMode=cv2.BORDER_REPLICATE)
+        warped = cv2.warpAffine(
+            image_bgr, M, (w, h),
+            flags=interp,
+            borderMode=cv2.BORDER_REPLICATE
+        )
 
-        poly = np.asarray(polygon_xy, dtype=np.float32)
-        pts1 = np.hstack([poly, np.ones((len(poly), 1), dtype=np.float32)])
-        poly_t = (M @ pts1.T).T
-        polys_per_frame.append(poly_t.astype(np.float32))
+        pts_t = (M @ pts1.T).T
+        polys_per_frame.append(pts_t.astype(np.float32))
 
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(mask, [poly_t.astype(np.int32)], 255)
+        if alpha_mask is not None:
+            warped_alpha = cv2.warpAffine(
+                alpha_mask,
+                M,
+                (w, h),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            mask_poly = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(mask_poly, [pts_t.astype(np.int32)], 255)
+            mask = cv2.bitwise_and(warped_alpha, mask_poly)
+        else:
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(mask, [pts_t.astype(np.int32)], 255)
 
         rgba = np.zeros((h, w, 4), dtype=np.uint8)
         rgba[:, :, :3] = warped
@@ -169,6 +199,7 @@ def animate_polygon(image_bgr, polygon_xy, path_xy, scales, rotations_deg, inter
         frames_rgba.append(rgba)
 
     return frames_rgba, polys_per_frame
+
 
 def composite_frames(background_bgr, list_of_layer_frame_lists):
     frames = []
@@ -272,6 +303,7 @@ class Layer:
     name: str
     source_bgr: np.ndarray
     polygon_xy: Optional[np.ndarray] = None
+    alpha_mask: Optional[np.ndarray] = None  # NEW: per-pixel alpha (uint8 H×W)
     origin_local_xy: Optional[np.ndarray] = None  # bbox center in item coords
     is_external: bool = False
     pixmap_item: Optional[QtWidgets.QGraphicsPixmapItem] = None
@@ -281,6 +313,7 @@ class Layer:
     path_lines: List[QGraphicsLineItem] = field(default_factory=list)
     preview_line: Optional[QGraphicsLineItem] = None
     color: QColor = field(default_factory=lambda: QColor(255, 99, 99))
+
 
     def has_polygon(self) -> bool:
         return self.polygon_xy is not None and len(self.polygon_xy) >= 3
@@ -414,6 +447,29 @@ class Canvas(QGraphicsView):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
+        # --- DEBUG flag ---
+        self._debug_enabled = True
+
+    # ---------- DEBUG HELPERS ----------
+    def _dbg(self, *args):
+        if not getattr(self, "_debug_enabled", False):
+            return
+        print("[DBG]", *args)
+
+    def _debug_layers(self, label=""):
+        if not getattr(self, "_debug_enabled", False):
+            return
+        print(f"\n[DBG] ===== LAYERS STATE ({label}) =====")
+        print("  current_layer:",
+              repr(self.current_layer.name) if self.current_layer else None,
+              "id=", id(self.current_layer) if self.current_layer else None)
+        for idx, L in enumerate(self.layers):
+            print(f"   [{idx}] id={id(L)} name={L.name!r} "
+                  f"is_external={L.is_external} "
+                  f"pixmap_id={id(L.pixmap_item) if L.pixmap_item else None} "
+                  f"num_kf={len(L.keyframes)} "
+                  f"polygon={'yes' if (L.polygon_xy is not None) else 'no'}")
+        print("[DBG] ==================================\n")
 
     # ------------ small helpers ------------
     def _remove_if_in_scene(self, item):
@@ -441,13 +497,22 @@ class Canvas(QGraphicsView):
 
     # ------------ Icons ------------
     def make_pentagon_icon(self) -> QIcon:
-        pm = QPixmap(22, 22)
-        pm.fill(Qt.GlobalColor.transparent)
-        p = QPainter(pm)
+        size = 22
+        img = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(Qt.transparent)
+
+        p = QPainter(img)
+        if not p.isActive():
+            # Safety fallback: return an empty icon instead of spamming warnings
+            return QIcon()
+
         p.setRenderHint(QPainter.Antialiasing, True)
-        pen = QPen(QColor(40, 40, 40)); pen.setWidth(2)
+        pen = QPen(QColor(40, 40, 40))
+        pen.setWidth(2)
         p.setPen(pen)
-        r = 8; cx, cy = 11, 11
+
+        r = 8
+        cx, cy = size // 2, size // 2
         pts = []
         for i in range(5):
             ang = -90 + i * 72
@@ -455,6 +520,8 @@ class Canvas(QGraphicsView):
             pts.append(QPointF(cx + r * np.cos(rad), cy + r * np.sin(rad)))
         p.drawPolygon(QPolygonF(pts))
         p.end()
+
+        pm = QPixmap.fromImage(img)
         return QIcon(pm)
 
     # -------- Fit helpers --------
@@ -519,40 +586,70 @@ class Canvas(QGraphicsView):
         self.setSceneRect(0, 0, pm.width(), pm.height())
 
     # -------- External sprite layer (no keyframe yet) --------
-    def add_external_sprite_layer(self, raw_bgr: np.ndarray) -> 'Layer':
+    def add_external_sprite_layer(self, raw_img: np.ndarray) -> 'Layer':
         if self.base_bgr is None:
             return None
+
         H, W = self.base_bgr.shape[:2]
-        h0, w0 = raw_bgr.shape[:2]
+        h0, w0 = raw_img.shape[:2]
+
+        # Scale external so that its height is ~60% of the canvas
         target_h = int(0.6 * H)
         scale = target_h / float(h0)
         ew = int(round(w0 * scale))
         eh = int(round(h0 * scale))
-        ext_small = cv2.resize(raw_bgr, (ew, eh), interpolation=cv2.INTER_AREA)
+        ext_small = cv2.resize(raw_img, (ew, eh), interpolation=cv2.INTER_AREA)
 
-        # pack onto same canvas size as base
+        # Pack onto same canvas size as base
         px = (W - ew) // 2
         py = (H - eh) // 2
+
         source_bgr = np.zeros((H, W, 3), dtype=np.uint8)
+        alpha_canvas = np.zeros((H, W), dtype=np.uint8)
+
         x0 = max(px, 0); y0 = max(py, 0)
         x1 = min(px + ew, W); y1 = min(py + eh, H)
         if x0 < x1 and y0 < y1:
             sx0 = x0 - px; sy0 = y0 - py
             sx1 = sx0 + (x1 - x0); sy1 = sy0 + (y1 - y0)
-            source_bgr[y0:y1, x0:x1] = ext_small[sy0:sy1, sx0:sx1]
+            sub = ext_small[sy0:sy1, sx0:sx1]
 
-        rect_poly = np.array([[px, py], [px+ew, py], [px+ew, py+eh], [px, py+eh]], dtype=np.float32)
-        cx, cy = px + ew/2.0, py + eh/2.0
+            if sub.ndim == 2:
+                sub_bgr = cv2.cvtColor(sub, cv2.COLOR_GRAY2BGR)
+                source_bgr[y0:y1, x0:x1] = sub_bgr
+                alpha_canvas[y0:y1, x0:x1] = 255
+            elif sub.shape[2] == 4:
+                # BGRA: keep RGB, use A as alpha
+                source_bgr[y0:y1, x0:x1] = sub[:, :, :3]
+                alpha_canvas[y0:y1, x0:x1] = sub[:, :, 3]
+            else:
+                # BGR: fully opaque rectangle
+                source_bgr[y0:y1, x0:x1] = sub
+                alpha_canvas[y0:y1, x0:x1] = 255
 
-        mask_rect = np.zeros((H, W), dtype=np.uint8)
-        cv2.fillPoly(mask_rect, [rect_poly.astype(np.int32)], 255)
-        rgba = np.dstack([cv2.cvtColor(source_bgr, cv2.COLOR_BGR2RGB), mask_rect])
+        rect_poly = np.array(
+            [[px, py], [px + ew, py], [px + ew, py + eh], [px, py + eh]],
+            dtype=np.float32
+        )
+        cx, cy = px + ew / 2.0, py + eh / 2.0
+
+        rgba = np.dstack([cv2.cvtColor(source_bgr, cv2.COLOR_BGR2RGB), alpha_canvas])
         pm = np_rgba_to_qpixmap(rgba)
 
-        color = PALETTE[self.layer_index % len(PALETTE)]; self.layer_index += 1
-        L = Layer(name=f"Layer {len(self.layers)+1} (ext)", source_bgr=source_bgr, is_external=True,
-                  polygon_xy=rect_poly.copy(), origin_local_xy=np.array([cx, cy], dtype=np.float32), color=color)
-        self.layers.append(L); self.current_layer = L
+        color = PALETTE[self.layer_index % len(PALETTE)]
+        self.layer_index += 1
+
+        L = Layer(
+            name=f"Layer {len(self.layers) + 1} (ext)",
+            source_bgr=source_bgr,
+            polygon_xy=rect_poly.copy(),
+            alpha_mask=alpha_canvas.copy(),          # NEW
+            origin_local_xy=np.array([cx, cy], dtype=np.float32),
+            is_external=True,
+            color=color,
+        )
+        self.layers.append(L)
+        self.current_layer = L
 
         def on_change():
             if L.keyframes:
@@ -566,7 +663,8 @@ class Canvas(QGraphicsView):
         item.setTransformationMode(Qt.FastTransformation)
         item.setShapeMode(QGraphicsPixmapItem.ShapeMode.MaskShape)
         item.setTransformOriginPoint(QPointF(cx, cy))
-        self.scene.addItem(item); L.pixmap_item = item
+        self.scene.addItem(item)
+        L.pixmap_item = item
 
         # start slightly to the left, still visible
         min_vis = min(max(40, ew // 5), W // 2)
@@ -574,8 +672,9 @@ class Canvas(QGraphicsView):
         item.setPos(outside_x, 0)
 
         # rect outline + handles (for initial placement)
-        qpath = QPainterPath(QPointF(rect_poly[0,0], rect_poly[0,1]))
-        for i in range(1, len(rect_poly)): qpath.lineTo(QPointF(rect_poly[i,0], rect_poly[i,1]))
+        qpath = QPainterPath(QPointF(rect_poly[0, 0], rect_poly[0, 1]))
+        for i in range(1, len(rect_poly)):
+            qpath.lineTo(QPointF(rect_poly[i, 0], rect_poly[i, 1]))
         qpath.closeSubpath()
         outline = QGraphicsPathItem(qpath, parent=item)
         outline.setPen(QPen(L.color, 2, Qt.DashLine))
@@ -584,6 +683,11 @@ class Canvas(QGraphicsView):
         self._create_handles_for_layer(L)
 
         self._expand_scene_to_item(item, center=True)
+
+        # DEBUG
+        self._dbg(f"add_external_sprite_layer -> created {L.name} id={id(L)}")
+        self._debug_layers("after add_external_sprite_layer")
+
         return L
 
     def place_external_initial_keyframe(self, L: 'Layer'):
@@ -597,6 +701,12 @@ class Canvas(QGraphicsView):
         ))
         self._ensure_preview_line(L)
 
+        # DEBUG
+        self._dbg(f"place_external_initial_keyframe: layer={L.name} id={id(L)} "
+                  f"now num_kf={len(L.keyframes)}")
+        self._debug_layers("after place_external_initial_keyframe")
+
+
     # -------- Polygon authoring --------
     def new_layer_from_source(self, name: str, source_bgr: np.ndarray, is_external: bool):
         color = PALETTE[self.layer_index % len(PALETTE)]; self.layer_index += 1
@@ -607,6 +717,12 @@ class Canvas(QGraphicsView):
     def start_draw_polygon(self, preserve_motion: bool):
         L = self.current_layer
         if L is None: return
+
+        # DEBUG
+        self._dbg(f"start_draw_polygon(preserve_motion={preserve_motion}) "
+                  f"on layer={L.name if L else None} id={id(L) if L else None}")
+        self._debug_layers("start_draw_polygon")
+
         if preserve_motion:
             for it in L.handle_items:
                 it.setVisible(False)
@@ -632,9 +748,11 @@ class Canvas(QGraphicsView):
         self.mode = Canvas.MODE_DRAW_POLY
         self.temp_points = []
         if self.temp_path_item is not None:
-            self.scene.removeItem(self.temp_path_item); self.temp_path_item = None
+            self._remove_if_in_scene(self.temp_path_item)
+            self.temp_path_item = None
         if self.first_click_marker is not None:
-            self.scene.removeItem(self.first_click_marker); self.first_click_marker = None
+            self._remove_if_in_scene(self.first_click_marker)
+            self.first_click_marker = None
         # reset hue preview for new segment
         self.current_segment_hue_deg = 0.0
 
@@ -681,92 +799,181 @@ class Canvas(QGraphicsView):
         L = self.current_layer
         if not (L and L.pixmap_item and L.polygon_xy is not None):
             return
-        # Rebuild pixmap of moving item with current hue (full strength preview)
+
+        # Apply hue on the layer's source
         bgr = L.source_bgr
         if abs(self.current_segment_hue_deg) > 1e-6:
             bgr = apply_hue_shift_bgr(bgr, self.current_segment_hue_deg)
-        rgba = self._make_rgba_from_bgr_and_maskpoly(bgr, L.polygon_xy)
+
+        H, W = bgr.shape[:2]
+
+        if L.alpha_mask is not None:
+            # External sprite: use polygon ∩ original alpha, so we don't reveal black canvas
+            poly_mask = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(poly_mask, [L.polygon_xy.astype(np.int32)], 255)
+            mask = cv2.bitwise_and(poly_mask, L.alpha_mask)
+            rgba = np.dstack([cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), mask])
+        else:
+            # Base-image cutouts keep the old behavior
+            rgba = self._make_rgba_from_bgr_and_maskpoly(bgr, L.polygon_xy)
+
         L.pixmap_item.setPixmap(np_rgba_to_qpixmap(rgba))
+
 
     def finish_polygon(self, preserve_motion: bool) -> bool:
         L = self.current_layer
         if L is None or self.mode != Canvas.MODE_DRAW_POLY: return False
         if len(self.temp_points) < 3: return False
 
+        # DEBUG
+        self._dbg(f"finish_polygon(preserve_motion={preserve_motion}) "
+                  f"on layer={L.name if L else None} id={id(L) if L else None} "
+                  f"num_kf={len(L.keyframes)} "
+                  f"is_external={L.is_external}")
+        self._debug_layers("before finish_polygon")
+
         pts_scene = [QtCore.QPointF(p) for p in self.temp_points]
 
         if preserve_motion and L.pixmap_item is not None and L.is_external:
-            # ===== EXTERNAL split: remove old rect item, add static rect-with-hole and new moving polygon =====
             old_item = L.pixmap_item
 
-            # polygon in the old item's LOCAL coords (source_bgr space)
+            # --- 1. Polygon points in LOCAL coords of the external sprite ---
             pts_local_qt = [old_item.mapFromScene(p) for p in pts_scene]
             pts_local = np.array([[p.x(), p.y()] for p in pts_local_qt], dtype=np.float32)
 
-            # origin for moving poly = polygon bbox center
+            # Polygon bbox centre (local coords)
             x0, y0 = pts_local.min(axis=0)
             x1, y1 = pts_local.max(axis=0)
-            cx_local, cy_local = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+            cx_local = (x0 + x1) / 2.0
+            cy_local = (y0 + y1) / 2.0
+            poly_center_local = np.array([cx_local, cy_local], dtype=np.float32)
 
-            rect_poly_prev = (L.polygon_xy.copy()
-                              if (L.polygon_xy is not None and len(L.polygon_xy) >= 3)
-                              else self._compute_ext_rect_from_source(L.source_bgr))
+            # Old origin (rectangle centre) in local + scene coords
+            if L.origin_local_xy is not None:
+                old_origin_local = L.origin_local_xy.astype(np.float32)
+            else:
+                # Fallback: compute from source_bgr non-zero bbox
+                rect_poly_prev = self._compute_ext_rect_from_source(L.source_bgr)
+                old_origin_local = rect_poly_prev.mean(axis=0).astype(np.float32)
 
-            # cache pose / z
-            old_origin_scene = old_item.mapToScene(old_item.transformOriginPoint())
+            old_origin_scene = old_item.mapToScene(
+                QPointF(old_origin_local[0], old_origin_local[1])
+            )
+            poly_center_scene = old_item.mapToScene(
+                QPointF(poly_center_local[0], poly_center_local[1])
+            )
+
             old_rot = old_item.rotation()
             old_scale = old_item.scale() if old_item.scale() != 0 else 1.0
             old_z = old_item.zValue()
 
-            # build RGBA for moving polygon & static rect-with-hole
+            # Rectangle polygon of the whole sprite in local coords
+            rect_poly_prev = (
+                L.polygon_xy.copy()
+                if (L.polygon_xy is not None and len(L.polygon_xy) >= 3)
+                else self._compute_ext_rect_from_source(L.source_bgr)
+            )
+
+            # --- 2. Re-interpret existing keyframes for the polygon centre ---
+            # We had keyframes for the rectangle centre; now we want them for the
+            # polygon centre, so we add R(scale,rot) * (poly_center_local - old_origin_local)
+            delta_local = poly_center_local - old_origin_local
+            for kf in L.keyframes:
+                theta = np.deg2rad(kf.rot_deg)
+                s = float(kf.scale if kf.scale != 0 else 1.0)
+                R = np.array(
+                    [[np.cos(theta), -np.sin(theta)],
+                     [np.sin(theta),  np.cos(theta)]],
+                    dtype=np.float32
+                ) * s
+                delta_scene = R @ delta_local
+                kf.pos = kf.pos + delta_scene
+
+            # --- 3. Build RGBA for moving polygon (keep original PNG alpha) ---
             H, W = L.source_bgr.shape[:2]
             rgb_full = cv2.cvtColor(L.source_bgr, cv2.COLOR_BGR2RGB)
 
-            mov_mask = np.zeros((H, W), dtype=np.uint8); cv2.fillPoly(mov_mask, [pts_local.astype(np.int32)], 255)
-            mov_rgba = np.dstack([rgb_full, mov_mask])
+            mov_mask = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(mov_mask, [pts_local.astype(np.int32)], 255)
 
-            hole_mask = np.zeros((H, W), dtype=np.uint8); cv2.fillPoly(hole_mask, [pts_local.astype(np.int32)], 255)
+            # Save original alpha BEFORE we overwrite it
+            orig_alpha = L.alpha_mask.copy() if L.alpha_mask is not None else None
+
+            if orig_alpha is not None:
+                new_alpha = cv2.bitwise_and(mov_mask, orig_alpha)
+            else:
+                new_alpha = mov_mask
+
+            # This is now the per-pixel alpha of the moving polygon (for animation)
+            L.alpha_mask = new_alpha
+
+            mov_rgba = np.dstack([rgb_full, new_alpha])
+
+            # --- 4. Static "rest of the sprite" item (with hole) ---
+            hole_mask = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(hole_mask, [pts_local.astype(np.int32)], 255)
             inpainted_ext = inpaint_background(L.source_bgr, hole_mask > 0)
-            rect_mask = np.zeros((H, W), dtype=np.uint8); cv2.fillPoly(rect_mask, [rect_poly_prev.astype(np.int32)], 255)
-            static_rgba = np.dstack([cv2.cvtColor(inpainted_ext, cv2.COLOR_BGR2RGB), rect_mask])
 
-            # remove old outline/handles and the old item itself
+            rect_mask = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(rect_mask, [rect_poly_prev.astype(np.int32)], 255)
+
+            if orig_alpha is not None:
+                inv_mov = cv2.bitwise_not(mov_mask)
+                # Keep original transparency and remove the polygon area
+                static_alpha = cv2.bitwise_and(orig_alpha, inv_mov)
+            else:
+                # No original alpha: just "rect minus polygon"
+                static_alpha = cv2.bitwise_and(rect_mask, cv2.bitwise_not(mov_mask))
+
+            static_rgba = np.dstack(
+                [cv2.cvtColor(inpainted_ext, cv2.COLOR_BGR2RGB), static_alpha]
+            )
+
+            # --- 5. Remove old item + handles ---
             if L.outline_item is not None:
-                self._remove_if_in_scene(L.outline_item); L.outline_item = None
+                self._remove_if_in_scene(L.outline_item)
+                L.outline_item = None
             for it in L.handle_items:
                 self._remove_if_in_scene(it)
             L.handle_items = []
             self._remove_if_in_scene(old_item)
 
-            # STATIC rect (non-movable, below)
-            kf0 = L.keyframes[0] if L.keyframes else Keyframe(
-                pos=np.array([old_origin_scene.x(), old_origin_scene.y()], dtype=np.float32),
-                rot_deg=old_rot, scale=old_scale, hue_deg=0.0
-            )
+            # --- 6. Static sprite (for visual context only, not animated) ---
             static_item = QGraphicsPixmapItem(np_rgba_to_qpixmap(static_rgba))
             static_item.setZValue(max(1.0, old_z - 0.2))
             static_item.setTransformationMode(Qt.FastTransformation)
             static_item.setShapeMode(QGraphicsPixmapItem.ShapeMode.MaskShape)
-            rcx = (rect_poly_prev[:,0].min() + rect_poly_prev[:,0].max())/2.0
-            rcy = (rect_poly_prev[:,1].min() + rect_poly_prev[:,1].max())/2.0
+
+            rcx = (rect_poly_prev[:, 0].min() + rect_poly_prev[:, 0].max()) / 2.0
+            rcy = (rect_poly_prev[:, 1].min() + rect_poly_prev[:, 1].max()) / 2.0
             static_item.setTransformOriginPoint(QPointF(rcx, rcy))
             self.scene.addItem(static_item)
-            self._apply_pose_from_origin_scene(static_item, QPointF(kf0.pos[0], kf0.pos[1]), kf0.rot_deg, kf0.scale)
-            # dashed outline for static
-            qpath_rect = QPainterPath(QPointF(rect_poly_prev[0,0], rect_poly_prev[0,1]))
-            for i in range(1, len(rect_poly_prev)): qpath_rect.lineTo(QPointF(rect_poly_prev[i,0], rect_poly_prev[i,1]))
+            # Keep it exactly where the external sprite was right now
+            self._apply_pose_from_origin_scene(
+                static_item, old_origin_scene, old_rot, old_scale
+            )
+
+            qpath_rect = QPainterPath(
+                QPointF(rect_poly_prev[0, 0], rect_poly_prev[0, 1])
+            )
+            for i in range(1, len(rect_poly_prev)):
+                qpath_rect.lineTo(
+                    QPointF(rect_poly_prev[i, 0], rect_poly_prev[i, 1])
+                )
             qpath_rect.closeSubpath()
             outline_static = QGraphicsPathItem(qpath_rect, parent=static_item)
             outline_static.setPen(QPen(L.color, 1, Qt.DashLine))
             outline_static.setZValue(static_item.zValue() + 0.01)
 
-            # NEW MOVING polygon (on top)
+            # --- 7. New MOVING polygon item (what you will animate) ---
             def on_change():
                 if L.keyframes:
                     self._ensure_preview_line(L)
                 self._relayout_handles(L)
 
-            poly_item = NotifyingPixmapItem(np_rgba_to_qpixmap(mov_rgba), on_change_cb=on_change)
+            poly_item = NotifyingPixmapItem(
+                np_rgba_to_qpixmap(mov_rgba), on_change_cb=on_change
+            )
             poly_item.setZValue(old_z + 0.2)
             poly_item.setFlag(QGraphicsPixmapItem.ItemIsMovable, True)
             poly_item.setFlag(QGraphicsPixmapItem.ItemIsSelectable, False)
@@ -774,26 +981,62 @@ class Canvas(QGraphicsView):
             poly_item.setShapeMode(QGraphicsPixmapItem.ShapeMode.MaskShape)
             poly_item.setTransformOriginPoint(QPointF(cx_local, cy_local))
             self.scene.addItem(poly_item)
-            self._apply_pose_from_origin_scene(poly_item, old_origin_scene, old_rot, old_scale)
 
-            # outline/handles on moving polygon
-            qpath = QPainterPath(QPointF(pts_local[0,0], pts_local[0,1]))
-            for i in range(1, len(pts_local)): qpath.lineTo(QPointF(pts_local[i,0], pts_local[i,1]))
+            # IMPORTANT: keep the polygon exactly where you drew it
+            self._apply_pose_from_origin_scene(
+                poly_item, poly_center_scene, old_rot, old_scale
+            )
+
+            # Outline + handles on moving polygon
+            qpath = QPainterPath(QPointF(pts_local[0, 0], pts_local[0, 1]))
+            for i in range(1, len(pts_local)):
+                qpath.lineTo(QPointF(pts_local[i, 0], pts_local[i, 1]))
             qpath.closeSubpath()
             outline_move = QGraphicsPathItem(qpath, parent=poly_item)
             outline_move.setPen(QPen(L.color, 2))
             outline_move.setZValue(poly_item.zValue() + 1)
 
+            # Update layer meta to refer to the polygon, not the old rectangle
             L.polygon_xy = pts_local
-            L.origin_local_xy = np.array([cx_local, cy_local], dtype=np.float32)
+            L.origin_local_xy = poly_center_local
             L.pixmap_item = poly_item
             L.outline_item = outline_move
-            self._create_handles_for_layer(L)
+
+
+            # ---- RESET MOTION AFTER CUTTING POLYGON ----
+            # Treat this cut as "new start": keep ONE keyframe at the current pose,
+            # and remove any old trajectory/path lines.
+            for ln in L.path_lines:
+                self._remove_if_in_scene(ln)
+            L.path_lines = []
+
+            if L.preview_line is not None:
+                self._remove_if_in_scene(L.preview_line)
+                L.preview_line = None
+
+            # Single keyframe at the *current* pose of the new polygon
+            origin_scene_now = poly_item.mapToScene(poly_item.transformOriginPoint())
+            L.keyframes = [
+                Keyframe(
+                    pos=np.array([origin_scene_now.x(), origin_scene_now.y()], dtype=np.float32),
+                    rot_deg=float(poly_item.rotation()),
+                    scale=float(poly_item.scale()) if poly_item.scale() != 0 else 1.0,
+                    hue_deg=0.0,
+                )
+            ]
+
+            # No path line yet – it will appear after the next 🎯 End Segment
             self._ensure_preview_line(L)
 
-            # live hue preview starts neutral for new poly
+            # Recreate handles on the new polygon item
+            self._create_handles_for_layer(L)
+
+            # New segment hue preview starts neutral again
             self.current_segment_hue_deg = 0.0
+
+            # Keep view framing sane
             self._expand_scene_to_item(poly_item, center=True)
+
 
         else:
             # ===== BASE image polygon path =====
@@ -848,6 +1091,11 @@ class Canvas(QGraphicsView):
         self.mode = Canvas.MODE_IDLE
         # ensure the current hue preview is applied (neutral at first)
         self._update_current_item_hue_preview()
+
+        # DEBUG
+        self._dbg("finish_polygon: completed")
+        self._debug_layers("after finish_polygon")
+
         return True
 
     # -------- UI helpers --------
@@ -969,13 +1217,8 @@ class Canvas(QGraphicsView):
                 color = self.current_layer.color if self.current_layer else QColor(255, 0, 0)
                 self._update_temp_path_item(color)
             elif event.button() == Qt.RightButton:
-                # Finish polygon with right-click
-                preserve = (
-                    self.current_layer is not None
-                    and self.current_layer.pixmap_item is not None
-                    and self.current_layer.is_external
-                )
-                ok = self.finish_polygon(preserve_motion=preserve)
+                ok = self.finish_polygon(preserve_motion=False)
+
                 self.polygon_finished.emit(ok)
                 if not ok:
                     QMessageBox.information(self, "Polygon", "Need at least 3 points.")
@@ -1004,18 +1247,29 @@ class Canvas(QGraphicsView):
                     self._update_temp_path_item(color)
                 return
             elif event.key() == Qt.Key_Escape:
-                if self.temp_path_item is not None: self.scene.removeItem(self.temp_path_item); self.temp_path_item = None
-                if self.first_click_marker is not None: self.scene.removeItem(self.first_click_marker); self.first_click_marker = None
+                if self.temp_path_item is not None:
+                    self._remove_if_in_scene(self.temp_path_item)
+                    self.temp_path_item = None
+                if self.first_click_marker is not None:
+                    self._remove_if_in_scene(self.first_click_marker)
+                    self.first_click_marker = None
                 self.temp_points = []
                 self.mode = Canvas.MODE_IDLE
                 return
+
         super().keyPressEvent(event)
 
     # keyframes
     def end_segment_add_keyframe(self):
-        if not (self.current_layer and self.current_layer.pixmap_item and (self.current_layer.polygon_xy is not None) and self.current_layer.keyframes):
+        L = self.current_layer
+
+        if not (L and L.pixmap_item and (L.polygon_xy is not None) and L.keyframes):
+            self._dbg("end_segment_add_keyframe: nothing to record",
+                      "layer=", L.name if L else None)
+            self._debug_layers("end_segment_add_keyframe (NOOP)")
             return False
-        item = self.current_layer.pixmap_item
+
+        item = L.pixmap_item
         origin_scene = item.mapToScene(item.transformOriginPoint())
         kf = Keyframe(
             pos=np.array([origin_scene.x(), origin_scene.y()], dtype=np.float32),
@@ -1023,7 +1277,7 @@ class Canvas(QGraphicsView):
             scale=float(item.scale()) if item.scale()!=0 else 1.0,
             hue_deg=float(self.current_segment_hue_deg)
         )
-        L = self.current_layer
+
         if len(L.keyframes) >= 1:
             p0 = L.keyframes[-1].pos; p1 = kf.pos
             if L.preview_line is not None:
@@ -1031,13 +1285,21 @@ class Canvas(QGraphicsView):
             line = QGraphicsLineItem(p0[0], p0[1], p1[0], p1[1])
             line.setPen(QPen(L.color, 2)); line.setZValue(900); self.scene.addItem(line)
             L.path_lines.append(line)
+
         L.keyframes.append(kf)
         self._ensure_preview_line(L)
         # reset hue for next leg
         self.current_segment_hue_deg = 0.0
         # refresh preview back to neutral
         self._update_current_item_hue_preview()
+
+        # DEBUG
+        self._dbg(f"end_segment_add_keyframe: added kf #{len(L.keyframes)} "
+                  f"to layer={L.name} id={id(L)}")
+        self._debug_layers("end_segment_add_keyframe (OK)")
+
         return True
+
 
     def has_pending_transform(self) -> bool:
         L = self.current_layer
@@ -1199,13 +1461,16 @@ class Canvas(QGraphicsView):
             L = self.current_layer
             if (L.pixmap_item is not None) and (len(L.keyframes) <= 1) and (len(L.path_lines) == 0):
                 if L.preview_line is not None:
-                    self.scene.removeItem(L.preview_line); L.preview_line = None
+                    self._remove_if_in_scene(L.preview_line)
+                    L.preview_line = None
                 if L.outline_item is not None:
-                    self.scene.removeItem(L.outline_item); L.outline_item = None
+                    self._remove_if_in_scene(L.outline_item)
+                    L.outline_item = None
                 for it in L.handle_items:
-                    self.scene.removeItem(it)
+                    self._remove_if_in_scene(it)
                 L.handle_items.clear()
-                self.scene.removeItem(L.pixmap_item); L.pixmap_item = None
+                self._remove_if_in_scene(L.pixmap_item)
+                L.pixmap_item = None
                 try:
                     idx = self.layers.index(L)
                     self.layers.pop(idx)
@@ -1273,9 +1538,18 @@ class Canvas(QGraphicsView):
             hue_to_frames: Dict[int, List[np.ndarray]] = {}
             for k in range(K):
                 bgr_h = apply_hue_shift_bgr(L.source_bgr, hue_values[k])
-                frames_h, _ = animate_polygon(bgr_h, L.polygon_xy, path_xy, scales, rots,
-                                              interp=cv2.INTER_LINEAR, origin_xy=origin_xy)
+                frames_h, _ = animate_polygon(
+                    bgr_h,
+                    L.polygon_xy,
+                    path_xy,
+                    scales,
+                    rots,
+                    interp=cv2.INTER_LINEAR,
+                    origin_xy=origin_xy,
+                    alpha_mask=L.alpha_mask,
+                )
                 hue_to_frames[k] = frames_h
+
 
             # Mix per frame using seg_idx / t
             frames_rgba = []
@@ -1331,7 +1605,8 @@ class MainWindow(QMainWindow):
 
         self.canvas = Canvas(self)
         self.canvas.polygon_finished.connect(self._on_canvas_polygon_finished)
-        self.canvas.end_segment_requested.connect(self.on_end_segment)
+        self.canvas.end_segment_requested.connect(self._on_canvas_end_segment_requested)
+
 
         # -------- Instruction banner above canvas (CENTERED) --------
         self.instruction_label = QLabel()
@@ -1441,7 +1716,12 @@ class MainWindow(QMainWindow):
 
     # ---------- Pending-segment guards ----------
     def _block_if_pending_segment(self, action_label: str) -> bool:
+        L = self.canvas.current_layer
         if self.canvas.current_layer and self.canvas.has_pending_transform():
+            print(f"[DBG] block_if_pending_segment({action_label!r}) "
+                  f"pending on layer={L.name if L else None} id={id(L) if L else None}")
+            self.canvas._debug_layers("block_if_pending_segment")
+
             QMessageBox.information(
                 self, "Finish Segment",
                 f"Please end the current segment (click '🎯 End Segment') before {action_label}."
@@ -1450,19 +1730,35 @@ class MainWindow(QMainWindow):
             return True
         return False
 
+
     # ------------- Actions -------------
     def on_select_base(self):
         if self._block_if_pending_segment("changing the base image"):
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Select image", "", "Images/Videos (*.png *.jpg *.jpeg *.bmp *.mp4 *.mov *.avi *.mkv)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select image", "", "Images/Videos (*.png *.jpg *.jpeg *.bmp *.mp4 *.mov *.avi *.mkv *.webp)")
         if not path:
             self._set_instruction("No image selected. Click ‘Select Image’ to begin.")
             return
         try:
-            raw = load_first_frame(path)
+            low = path.lower()
+            if low.endswith((".mp4", ".mov", ".avi", ".mkv")):
+                # videos: just reuse the usual helper (no alpha)
+                raw = load_first_frame(path)
+            else:
+                # images: preserve alpha if present
+                raw = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+                if raw is None:
+                    raise RuntimeError("Failed to read image")
+
+                if raw.ndim == 2:
+                    # grayscale → BGR
+                    raw = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
+                elif raw.shape[2] not in (3, 4):
+                    raise RuntimeError(f"Unsupported image shape: {raw.shape}")
         except Exception as e:
-            QMessageBox.critical(self, "Load", f"Failed to load: {e}")
+            QMessageBox.critical(self, "Load", f"Failed to load external: {e}")
             return
+
         self.canvas.set_base_image(raw)
         self.add_poly_active = False
         self.btn_add_poly.setText("Add Polygon")
@@ -1472,6 +1768,11 @@ class MainWindow(QMainWindow):
         self._set_instruction("Step 1: Add a polygon (Add Polygon), or add an external sprite (Add External Image).")
 
     def on_add_polygon_toggled(self):
+        print(f"[DBG] on_add_polygon_toggled: add_poly_active={self.add_poly_active}, "
+              f"placing_external={self.placing_external}, "
+              f"current_layer={self.canvas.current_layer.name if self.canvas.current_layer else None}")
+
+
         if self.placing_external:
             QMessageBox.information(self, "Place External First",
                                     "Please place the external image first (click ‘✅ Place External Image’).")
@@ -1490,16 +1791,14 @@ class MainWindow(QMainWindow):
             # --- KEY CHANGE ---
             # If there's no current layer OR the current layer is BASE -> make a NEW BASE layer (new color).
             # If the current layer is EXTERNAL -> split/cut that external (preserve motion).
-            if (self.canvas.current_layer is None) or (not self.canvas.current_layer.is_external):
-                # New polygon on the base image => new layer with a fresh color
-                self.canvas.new_layer_from_source(
-                    name=f"Layer {len(self.canvas.layers)+1}",
-                    source_bgr=self.canvas.base_bgr,
-                    is_external=False
-                )
-            else:
-                # Current layer is external: go into "draw polygon to cut external" mode
-                self.canvas.start_draw_polygon(preserve_motion=True)
+            # Always start a brand-new polygon layer on the base image,
+            # completely independent of any external layers / trajectories.
+            self.canvas.new_layer_from_source(
+                name=f"Layer {len(self.canvas.layers) + 1}",
+                source_bgr=self.canvas.base_bgr,
+                is_external=False,
+            )
+
             # --- END KEY CHANGE ---
 
             self.add_poly_active = True
@@ -1526,6 +1825,8 @@ class MainWindow(QMainWindow):
     def on_add_or_place_external(self):
         # If we're already in "placing" mode, finalize the initial keyframe.
         if self.placing_external and self.placing_layer is not None:
+            print(f"[DBG] on_add_or_place_external: finalizing placement for "
+            f"placing_layer={self.placing_layer.name} id={id(self.placing_layer)}")
             try:
                 # Lock the initial pose as keyframe #1
                 self.canvas.place_external_initial_keyframe(self.placing_layer)
@@ -1544,6 +1845,7 @@ class MainWindow(QMainWindow):
         # Otherwise, begin adding a new external image.
         if self._block_if_pending_segment("adding an external image"):
             return
+        
         if self.canvas.base_bgr is None:
             QMessageBox.information(self, "External", "Select a base image first.")
             self._set_instruction("Click ‘Select Image’ to begin.")
@@ -1551,14 +1853,36 @@ class MainWindow(QMainWindow):
 
         path, _ = QFileDialog.getOpenFileName(
             self, "Select external image", "",
-            "Images/Videos (*.png *.jpg *.jpeg *.bmp *.mp4 *.mov *.avi *.mkv)"
+            "Images/Videos (*.png *.jpg *.jpeg *.bmp *.mp4 *.mov *.avi *.mkv *.webp)"
         )
+
+        print(f"[DBG] on_add_or_place_external: user picked external {path}")
+
         if not path:
             self._set_instruction("External not chosen. You can Add External Image later.")
             return
 
         try:
-            raw = load_first_frame(path)
+            low = path.lower()
+            if low.endswith((".mp4", ".mov", ".avi", ".mkv")):
+                # videos: just one frame, no alpha
+                raw = load_first_frame(path)
+            else:
+                # images: preserve alpha if present
+                raw = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+                if raw is None:
+                    raise RuntimeError("Failed to read external image")
+
+                # Normalize to 3 or 4 channels
+                if raw.ndim == 2:
+                    # gray → BGRA (fully opaque)
+                    raw = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGRA)
+                elif raw.shape[2] == 3:
+                    # BGR → BGRA (fully opaque)
+                    alpha = np.full(raw.shape[:2] + (1,), 255, dtype=raw.dtype)
+                    raw = np.concatenate([raw, alpha], axis=2)
+                elif raw.shape[2] != 4:
+                    raise RuntimeError(f"Unsupported external image shape: {raw.shape}")
         except Exception as e:
             QMessageBox.critical(self, "Load", f"Failed to load external: {e}")
             return
@@ -1567,6 +1891,9 @@ class MainWindow(QMainWindow):
         if L is None:
             QMessageBox.critical(self, "External", "Failed to create external layer.")
             return
+
+        print(f"[DBG] on_add_or_place_external: new external layer {L.name} id={id(L)}")
+        self.canvas._debug_layers("after on_add_or_place_external")
 
         self.placing_external = True
         self.placing_layer = L
@@ -1611,12 +1938,30 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "End Segment", "Nothing to record yet. Add/finish a polygon or add/place an external sprite first.")
             self._set_instruction("Add a polygon (base/external) or place an external image, then drag and click ‘🎯 End Segment’.")
 
+    def _on_canvas_end_segment_requested(self):
+        """
+        Right-click in the canvas (when not drawing a polygon).
+
+        - If we are currently placing an external sprite, treat it as
+        '✅ Place External Image' (finish placement).
+        - Otherwise, behave like the normal '🎯 End Segment'.
+        """
+        if self.placing_external:
+            # Same as clicking the '✅ Place External Image' button
+            self.on_add_or_place_external()
+        else:
+            self.on_end_segment()
+
+
     def on_undo(self):
         if self.placing_external and self.placing_layer is not None:
             L = self.placing_layer
-            if L.pixmap_item is not None: self.canvas.scene.removeItem(L.pixmap_item)
-            if L.outline_item is not None: self.canvas.scene.removeItem(L.outline_item)
-            for it in L.handle_items: self.canvas.scene.removeItem(it)
+            if L.pixmap_item is not None:
+                self.canvas._remove_if_in_scene(L.pixmap_item)
+            if L.outline_item is not None:
+                self.canvas._remove_if_in_scene(L.outline_item)
+            for it in L.handle_items:
+                self.canvas._remove_if_in_scene(it)
             try:
                 idx = self.canvas.layers.index(L)
                 self.canvas.layers.pop(idx)
@@ -1812,12 +2157,19 @@ class MainWindow(QMainWindow):
             for k in range(K):
                 bgr_h = apply_hue_shift_bgr(L.source_bgr, hue_values[k])
                 frames_h, polys = animate_polygon(
-                    bgr_h, L.polygon_xy, path_xy, scales, rots,
-                    interp=cv2.INTER_LINEAR, origin_xy=origin_xy
+                    bgr_h,
+                    L.polygon_xy,
+                    path_xy,
+                    scales,
+                    rots,
+                    interp=cv2.INTER_LINEAR,
+                    origin_xy=origin_xy,
+                    alpha_mask=L.alpha_mask,
                 )
                 hue_to_frames[k] = frames_h
                 if polys_for_layer is None:  # same polys for all hues
                     polys_for_layer = np.array(polys, dtype=np.float32)
+
             if polys_for_layer is not None:
                 layer_polys.append(polys_for_layer)
 
@@ -1851,7 +2203,8 @@ class MainWindow(QMainWindow):
         # --- Actual saving ---
         try:
             # first_frame.png (copy of the base image used for saving)
-            cv2.imwrite(first_frame_path, self.canvas.base_bgr)
+            first_frame = frames_out[0]
+            cv2.imwrite(first_frame_path, first_frame)
 
             # motion_signal.mp4 = composited warped video
             save_video_mp4(frames_out, motion_path, fps=fps)
@@ -1896,6 +2249,7 @@ def main():
     if sys.version_info < (3, 8):
         print("[Warning] PySide6 officially supports Python 3.8+. You're on %d.%d." % (sys.version_info.major, sys.version_info.minor))
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(True)  # make sure the app quits
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
