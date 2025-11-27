@@ -7,8 +7,8 @@ Given an input frame, you can cut and drag polygons from the initial image, tran
 - Select an initial image.
 - Draw polygons in the image and drag them in several segments.
 - During segments you can rotate, scale, and change the polygon colors!
-- Polygons can also be dragged from an external image you can add into the scene.
-- Write an text prompt that will be used to generate the video afterwards.
+- You can also add an external image into the scene and move it (or polygons cut from it) across segments. Transparency is preserved.
+- Write a text prompt that will be used to generate the video afterwards.
 - You can preview the motion signal in an in-app demo.
 - In the end, all the inputs needed for **Time-to-Move** are saved automatically in a selected output directory.
 
@@ -37,9 +37,9 @@ python cut_and_drag.py
     * The movement trajectory can be constructed from multiple segments: repeat move → 🎯 End Segment → move → 🎯 End Segment…
 * External Image
     * Another option is to add an external image to the scene.
-    * Click 🖼️➕ Add External Image, pick a new image.
-    * Position/scale/rotate it for its initial pose, then click ✅ Place External Image to lock its starting pose.
-    * Now animate it like before: mark a polygon, move, etc.
+    * Click 🖼️➕ Add External Image, pick a new image (transparent PNGs are supported).
+    * Position/scale/rotate it for its initial pose, then click ✅ Place External Image or right-click on the canvas to lock its starting pose.
+    * Now animate it like before: you can move the external image itself, or cut a polygon from it and move it.
 * Prompt
     * Type any text prompt you want associated with this example; it will be used later for video generation with our method.
 * Preview and Save
