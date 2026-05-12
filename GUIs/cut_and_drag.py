@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os, sys, cv2, numpy as np
+import os, sys, cv2, json, numpy as np
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict
 import shutil, subprocess
@@ -291,12 +291,56 @@ PALETTE = [
     QColor(120, 255, 255)  # cyan
 ]
 
+def apply_easing(t_array, easing_type):
+    """Apply easing function to a numpy array of t values in [0,1]."""
+    t = t_array.copy()
+    if easing_type == "linear":
+        return t
+    elif easing_type == "ease_in":
+        return t * t
+    elif easing_type == "ease_out":
+        return 1.0 - (1.0 - t) * (1.0 - t)
+    elif easing_type == "ease_in_out":
+        return np.where(t < 0.5, 2.0 * t * t, 1.0 - (-2.0 * t + 2.0) ** 2 / 2.0)
+    return t
+
+EASING_TYPES = ["linear", "ease_in", "ease_out", "ease_in_out"]
+
 @dataclass
 class Keyframe:
     pos: np.ndarray          # (2,)
     rot_deg: float
     scale: float
     hue_deg: float = 0.0
+    easing: str = "linear"   # easing for the segment ENDING at this keyframe
+
+class KeyframeMarker(QGraphicsEllipseItem):
+    """Clickable circle marker representing a keyframe position on the canvas.
+    Click to select — then drag the ITEM to reposition this keyframe."""
+    RADIUS = 6
+
+    def __init__(self, layer, kf_index, color, canvas):
+        super().__init__(-self.RADIUS, -self.RADIUS, self.RADIUS * 2, self.RADIUS * 2)
+        self.layer = layer
+        self.kf_index = kf_index
+        self.canvas = canvas
+        self.setBrush(color)
+        self.setPen(QPen(QColor(255, 255, 255), 1))
+        self.setZValue(1000)
+        self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.canvas.select_keyframe(self.layer, self.kf_index)
+        super().mousePressEvent(event)
+
+    def set_selected_style(self, selected):
+        if selected:
+            self.setPen(QPen(QColor(255, 255, 0), 3))
+        else:
+            self.setPen(QPen(QColor(255, 255, 255), 1))
+
 
 @dataclass
 class Layer:
@@ -312,6 +356,7 @@ class Layer:
     keyframes: List[Keyframe] = field(default_factory=list)
     path_lines: List[QGraphicsLineItem] = field(default_factory=list)
     preview_line: Optional[QGraphicsLineItem] = None
+    keyframe_markers: List['KeyframeMarker'] = field(default_factory=list)
     color: QColor = field(default_factory=lambda: QColor(255, 99, 99))
 
 
@@ -407,6 +452,7 @@ class Canvas(QGraphicsView):
 
     polygon_finished = Signal(bool)
     end_segment_requested = Signal()
+    keyframe_selected = Signal(object)  # emits index or None
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -416,6 +462,7 @@ class Canvas(QGraphicsView):
         self.setDragMode(QGraphicsView.NoDrag)
         self.scene = QGraphicsScene(self)
         self.setScene(self.scene)
+        self._syncing = False  # guard against recursive sync
 
         self.base_bgr = None
         self.base_preview_bgr = None
@@ -435,6 +482,10 @@ class Canvas(QGraphicsView):
 
         # hue preview for current segment (degrees)
         self.current_segment_hue_deg: float = 0.0
+        # easing for current segment
+        self.current_segment_easing: str = "linear"
+        # selected keyframe for editing
+        self.selected_keyframe_idx: Optional[int] = None
 
         # Demo playback
         self.play_timer = QtCore.QTimer(self)
@@ -654,6 +705,7 @@ class Canvas(QGraphicsView):
         def on_change():
             if L.keyframes:
                 self._ensure_preview_line(L)
+                self.sync_item_to_active_keyframe()
             self._relayout_handles(L)
 
         item = NotifyingPixmapItem(pm, on_change_cb=on_change)
@@ -713,6 +765,50 @@ class Canvas(QGraphicsView):
         layer = Layer(name=name, source_bgr=source_bgr.copy(), is_external=is_external, color=color)
         self.layers.append(layer); self.current_layer = layer
         self.start_draw_polygon(preserve_motion=False)
+
+    def finish_polygon_from_points(self, polygon_xy: np.ndarray) -> Optional[Layer]:
+        """Create a polygon layer from pre-defined points (used for project loading)."""
+        if self.base_bgr is None:
+            return None
+        H, W = self.base_bgr.shape[:2]
+        name = f"layer_{len(self.layers)}"
+        source = self.base_bgr.copy()
+        layer = Layer(name=name, source_bgr=source, polygon_xy=polygon_xy.copy())
+
+        # Compute origin (polygon center)
+        x0, y0 = polygon_xy.min(axis=0)
+        x1, y1 = polygon_xy.max(axis=0)
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        layer.origin_local_xy = np.array([cx, cy], dtype=np.float32)
+
+        # Build RGBA cut-out from polygon
+        mask = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(mask, [polygon_xy.astype(np.int32)], 255)
+        rgb = cv2.cvtColor(source, cv2.COLOR_BGR2RGB)
+        rgba = np.zeros((H, W, 4), dtype=np.uint8)
+        rgba[:, :, :3] = rgb
+        rgba[:, :, 3] = mask
+
+        preview_rgba = self._apply_fit_rgba(rgba) if hasattr(self, '_apply_fit_rgba') else rgba
+        pm = np_rgba_to_qpixmap(preview_rgba if preview_rgba.shape[2] == 4 else rgba)
+        item = QGraphicsPixmapItem(pm)
+        item.setZValue(100 + len(self.layers))
+        item.setTransformOriginPoint(cx, cy)
+        item.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.scene.addItem(item)
+        layer.pixmap_item = item
+
+        # Initial keyframe at current position
+        origin_scene = item.mapToScene(item.transformOriginPoint())
+        kf0 = Keyframe(
+            pos=np.array([origin_scene.x(), origin_scene.y()], dtype=np.float32),
+            rot_deg=0.0, scale=1.0
+        )
+        layer.keyframes.append(kf0)
+
+        self.layers.append(layer)
+        self.current_layer = layer
+        return layer
 
     def start_draw_polygon(self, preserve_motion: bool):
         L = self.current_layer
@@ -969,6 +1065,7 @@ class Canvas(QGraphicsView):
             def on_change():
                 if L.keyframes:
                     self._ensure_preview_line(L)
+                    self.sync_item_to_active_keyframe()
                 self._relayout_handles(L)
 
             poly_item = NotifyingPixmapItem(
@@ -1057,6 +1154,7 @@ class Canvas(QGraphicsView):
             def on_change():
                 if L.keyframes:
                     self._ensure_preview_line(L)
+                    self.sync_item_to_active_keyframe()
                 self._relayout_handles(L)
             item = NotifyingPixmapItem(pm, on_change_cb=on_change)
             item.setZValue(10 + len(self.layers))
@@ -1275,7 +1373,8 @@ class Canvas(QGraphicsView):
             pos=np.array([origin_scene.x(), origin_scene.y()], dtype=np.float32),
             rot_deg=float(item.rotation()),
             scale=float(item.scale()) if item.scale()!=0 else 1.0,
-            hue_deg=float(self.current_segment_hue_deg)
+            hue_deg=float(self.current_segment_hue_deg),
+            easing=getattr(self, 'current_segment_easing', 'linear')
         )
 
         if len(L.keyframes) >= 1:
@@ -1287,6 +1386,7 @@ class Canvas(QGraphicsView):
             L.path_lines.append(line)
 
         L.keyframes.append(kf)
+        self._update_keyframe_markers(L)
         self._ensure_preview_line(L)
         # reset hue for next leg
         self.current_segment_hue_deg = 0.0
@@ -1327,6 +1427,95 @@ class Canvas(QGraphicsView):
         # restore hue preview to last keyframe hue
         self.current_segment_hue_deg = last.hue_deg
         self._update_current_item_hue_preview()
+
+    def _update_keyframe_markers(self, L: Layer):
+        """Recreate all keyframe markers for a layer."""
+        for m in L.keyframe_markers:
+            self._remove_if_in_scene(m)
+        L.keyframe_markers.clear()
+        for i, kf in enumerate(L.keyframes):
+            marker = KeyframeMarker(L, i, L.color, self)
+            marker.setPos(kf.pos[0], kf.pos[1])
+            if i == self.selected_keyframe_idx and L == self.current_layer:
+                marker.set_selected_style(True)
+            self.scene.addItem(marker)
+            L.keyframe_markers.append(marker)
+
+    def _update_path_lines(self, L: Layer):
+        """Recreate path lines between keyframes."""
+        for line in L.path_lines:
+            self._remove_if_in_scene(line)
+        L.path_lines.clear()
+        for i in range(len(L.keyframes) - 1):
+            p0 = L.keyframes[i].pos
+            p1 = L.keyframes[i + 1].pos
+            line = QGraphicsLineItem(p0[0], p0[1], p1[0], p1[1])
+            line.setPen(QPen(L.color, 2))
+            line.setZValue(900)
+            self.scene.addItem(line)
+            L.path_lines.append(line)
+
+    def select_keyframe(self, L: Layer, idx: int):
+        """Select a keyframe — item snaps to it, further drags edit THIS keyframe."""
+        self.selected_keyframe_idx = idx
+        self.current_layer = L
+        kf = L.keyframes[idx]
+        if L.pixmap_item:
+            self._syncing = True
+            try:
+                item = L.pixmap_item
+                item.setRotation(kf.rot_deg)
+                item.setScale(kf.scale)
+                origin_scene = item.mapToScene(item.transformOriginPoint())
+                d = QPointF(kf.pos[0] - origin_scene.x(), kf.pos[1] - origin_scene.y())
+                item.setPos(item.pos() + d)
+            finally:
+                self._syncing = False
+        for m in L.keyframe_markers:
+            m.set_selected_style(m.kf_index == idx)
+        self.keyframe_selected.emit(idx)
+
+    def deselect_keyframe(self):
+        """Deselect — item snaps back to last keyframe."""
+        L = self.current_layer
+        self.selected_keyframe_idx = None
+        if L:
+            for m in L.keyframe_markers:
+                m.set_selected_style(False)
+            if L.keyframes:
+                self._syncing = True
+                try:
+                    self.revert_to_last_keyframe(L)
+                finally:
+                    self._syncing = False
+        self.keyframe_selected.emit(None)
+
+    def sync_item_to_active_keyframe(self):
+        """Sync item position to active keyframe (selected or last). Called on every item move."""
+        if self._syncing:
+            return
+        L = self.current_layer
+        if L is None or not L.pixmap_item or not L.keyframes:
+            return
+
+        self._syncing = True
+        try:
+            item = L.pixmap_item
+            origin_scene = item.mapToScene(item.transformOriginPoint())
+
+            # Which keyframe to update: selected or last
+            idx = self.selected_keyframe_idx if self.selected_keyframe_idx is not None else len(L.keyframes) - 1
+            if idx >= len(L.keyframes):
+                return
+
+            kf = L.keyframes[idx]
+            kf.pos = np.array([origin_scene.x(), origin_scene.y()], dtype=np.float32)
+            kf.rot_deg = float(item.rotation())
+            kf.scale = float(item.scale()) if item.scale() != 0 else 1.0
+            self._update_path_lines(L)
+            self._update_keyframe_markers(L)
+        finally:
+            self._syncing = False
 
     def _sample_keyframes_constant_speed_with_seg(self, keyframes: List[Keyframe], T: int):
         """
@@ -1392,6 +1581,9 @@ class Canvas(QGraphicsView):
                 continue
             # Local times in [0,1) to avoid s+1 overflow in hue blending
             ts = np.linspace(0.0, 1.0, n, endpoint=False, dtype=np.float32)
+            # Apply easing from the end keyframe of this segment
+            seg_easing = keyframes[s + 1].easing if hasattr(keyframes[s + 1], 'easing') else "linear"
+            ts = apply_easing(ts, seg_easing)
 
             p0, p1 = P[s], P[s + 1]
             s0, s1 = max(1e-6, float(keyframes[s].scale)), max(1e-6, float(keyframes[s + 1].scale))
@@ -1446,9 +1638,6 @@ class Canvas(QGraphicsView):
             self.temp_points.pop()
             color = self.current_layer.color if self.current_layer else QColor(255,0,0)
             self._update_temp_path_item(color)
-            return True
-        if self.has_pending_transform():
-            self.revert_to_last_keyframe()
             return True
         if self.current_layer and len(self.current_layer.keyframes) > 1:
             L = self.current_layer
@@ -1606,6 +1795,7 @@ class MainWindow(QMainWindow):
         self.canvas = Canvas(self)
         self.canvas.polygon_finished.connect(self._on_canvas_polygon_finished)
         self.canvas.end_segment_requested.connect(self._on_canvas_end_segment_requested)
+        self.canvas.keyframe_selected.connect(self._on_keyframe_selected)
 
 
         # -------- Instruction banner above canvas (CENTERED) --------
@@ -1679,8 +1869,17 @@ class MainWindow(QMainWindow):
         self.sld_hue.valueChanged.connect(self.on_hue_changed)
         btn_default.clicked.connect(lambda: self.sld_hue.setValue(0))
 
-        # End Segment and Undo
-        self.btn_end_seg = add_btn("🎯 End Segment", self.on_end_segment)
+        # Easing selector
+        tb.addSeparator()
+        tb.addWidget(QLabel("Easing:"))
+        self.cmb_easing = QComboBox()
+        self.cmb_easing.addItems(EASING_TYPES)
+        self.cmb_easing.setCurrentText("linear")
+        self.cmb_easing.currentTextChanged.connect(self._on_easing_changed)
+        tb.addWidget(self.cmb_easing)
+
+        # Add Keyframe and Undo
+        self.btn_end_seg = add_btn("➕ Add Keyframe", self.on_end_segment)
         self.btn_undo   = add_btn("↩️ Undo", self.on_undo)
 
         tb.addSeparator()
@@ -1700,7 +1899,10 @@ class MainWindow(QMainWindow):
         # (Optional) If your PySide6 supports it, you can uncomment the next line:
         # self.txt_prompt.setPlaceholderText("Write your prompt here…")
         tb.addWidget(self.txt_prompt)
-        self.btn_save = add_btn("💾 Save", self.on_save)
+        self.btn_export = add_btn("📤 Export", self.on_save)
+        tb.addSeparator()
+        self.btn_save_project = add_btn("💾 Save Project", self.on_save_project)
+        self.btn_open_project = add_btn("📂 Open Project", self.on_open_project)
         self.btn_new  = add_btn("🆕 New", self.on_new)
         self.btn_exit = add_btn("⏹️ Exit", self.close)
 
@@ -1760,6 +1962,7 @@ class MainWindow(QMainWindow):
             return
 
         self.canvas.set_base_image(raw)
+        self.canvas._base_image_path = path
         self.add_poly_active = False
         self.btn_add_poly.setText("Add Polygon")
         self.placing_external = False; self.placing_layer = None
@@ -1938,6 +2141,28 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "End Segment", "Nothing to record yet. Add/finish a polygon or add/place an external sprite first.")
             self._set_instruction("Add a polygon (base/external) or place an external image, then drag and click ‘🎯 End Segment’.")
 
+    def _on_easing_changed(self, text):
+        self.canvas.current_segment_easing = text
+        # If a keyframe is selected, update its easing immediately
+        idx = self.canvas.selected_keyframe_idx
+        L = self.canvas.current_layer
+        if idx is not None and L and idx < len(L.keyframes):
+            L.keyframes[idx].easing = text
+            self.status_label.setText(f"Keyframe #{idx + 1} easing changed to '{text}'.")
+
+    def _on_keyframe_selected(self, idx):
+        if idx is not None:
+            L = self.canvas.current_layer
+            if L and idx < len(L.keyframes):
+                kf = L.keyframes[idx]
+                easing = kf.easing if hasattr(kf, 'easing') else "linear"
+                self.cmb_easing.blockSignals(True)
+                self.cmb_easing.setCurrentText(easing)
+                self.cmb_easing.blockSignals(False)
+            self.status_label.setText(f"Editing keyframe #{idx + 1}. Drag/scale/rotate to change. Click ➕ Add Keyframe for new frame.")
+        else:
+            self.status_label.setText("Editing last keyframe. Drag to reposition.")
+
     def _on_canvas_end_segment_requested(self):
         """
         Right-click in the canvas (when not drawing a polygon).
@@ -1988,6 +2213,12 @@ class MainWindow(QMainWindow):
         u = np.linspace(0.0, float(segs), T, dtype=np.float32)
         seg_idx = np.minimum(np.floor(u).astype(int), segs - 1)
         t = u - seg_idx
+        # Apply per-segment easing
+        for s in range(segs):
+            mask = seg_idx == s
+            if mask.any():
+                seg_easing = keyframes[s + 1].easing if hasattr(keyframes[s + 1], 'easing') else "linear"
+                t[mask] = apply_easing(t[mask], seg_easing)
         k0 = np.array([[keyframes[i].pos[0], keyframes[i].pos[1], keyframes[i].scale, keyframes[i].rot_deg] for i in seg_idx], dtype=np.float32)
         k1 = np.array([[keyframes[i+1].pos[0], keyframes[i+1].pos[1], keyframes[i+1].scale, keyframes[i+1].rot_deg] for i in seg_idx], dtype=np.float32)
         pos0 = k0[:, :2]; pos1 = k1[:, :2]
@@ -2013,9 +2244,237 @@ class MainWindow(QMainWindow):
         self.canvas.play_demo(fps=fps, T_total=T_total)
         self._set_instruction("Playing demo… When it ends, you’ll return to the editor. Tweak and play again, or 💾 Save.")
 
-    def on_new(self):
-        if self._block_if_pending_segment("starting a new project"):
+    def on_save_project(self):
+        """Save entire project state to a JSON file."""
+        if self.canvas.base_bgr is None:
+            QMessageBox.information(self, "Save Project", "Nothing to save — load an image first.")
             return
+
+        path, _ = QFileDialog.getSaveFileName(self, "Save Project", "", "TTM Project (*.ttmproj);;All Files (*)")
+        if not path:
+            return
+        if not path.endswith(".ttmproj"):
+            path += ".ttmproj"
+
+        project = {
+            "base_image_path": getattr(self.canvas, '_base_image_path', ''),
+            "fps": int(self.spn_fps.value()),
+            "total_frames": int(self.spn_total_frames.value()),
+            "prompt": self.txt_prompt.toPlainText() if hasattr(self, 'txt_prompt') else "",
+            "layers": []
+        }
+
+        for L in self.canvas.layers:
+            layer_data = {
+                "name": L.name,
+                "is_external": L.is_external,
+                "polygon_xy": L.polygon_xy.tolist() if L.polygon_xy is not None else None,
+                "origin_local_xy": L.origin_local_xy.tolist() if L.origin_local_xy is not None else None,
+                "color": [L.color.red(), L.color.green(), L.color.blue()] if hasattr(L, 'color') else [255, 100, 100],
+                "keyframes": [],
+            }
+            if L.is_external and L.source_bgr is not None:
+                # Save the source BGR (already canvas-sized from add_external_sprite_layer)
+                ext_path = os.path.join(os.path.dirname(path), f"{L.name}_sprite.png")
+                cv2.imwrite(ext_path, L.source_bgr)
+                layer_data["external_sprite_path"] = ext_path
+                layer_data["sprite_already_processed"] = True
+                if L.alpha_mask is not None:
+                    mask_path = os.path.join(os.path.dirname(path), f"{L.name}_alpha.png")
+                    cv2.imwrite(mask_path, L.alpha_mask)
+                    layer_data["alpha_mask_path"] = mask_path
+                # Save current transform state
+                if L.pixmap_item:
+                    layer_data["item_z"] = L.pixmap_item.zValue()
+                    layer_data["item_pos"] = [L.pixmap_item.pos().x(), L.pixmap_item.pos().y()]
+                    layer_data["item_rotation"] = L.pixmap_item.rotation()
+                    layer_data["item_scale"] = L.pixmap_item.scale() if L.pixmap_item.scale() != 0 else 1.0
+
+            for kf in L.keyframes:
+                layer_data["keyframes"].append({
+                    "pos": kf.pos.tolist(),
+                    "rot_deg": kf.rot_deg,
+                    "scale": kf.scale,
+                    "hue_deg": kf.hue_deg,
+                    "easing": getattr(kf, 'easing', 'linear'),
+                })
+            project["layers"].append(layer_data)
+
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(project, f, indent=2)
+            self.status_label.setText(f"Project saved: {os.path.basename(path)}")
+            self._set_instruction("Project saved! Continue editing or Export when ready.")
+        except Exception as e:
+            QMessageBox.critical(self, "Save Project", f"Failed to save:\n{e}")
+
+    def on_open_project(self):
+        """Load a project from a JSON file. Restores base image, settings and keyframe data."""
+        path, _ = QFileDialog.getOpenFileName(self, "Open Project", "", "TTM Project (*.ttmproj);;All Files (*)")
+        if not path:
+            return
+
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                project = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, "Open Project", f"Failed to read project:\n{e}")
+            return
+
+        # Load base image
+        base_path = project.get("base_image_path", "")
+        if not os.path.exists(base_path):
+            base_path, _ = QFileDialog.getOpenFileName(
+                self, "Base image not found — select it manually", "",
+                "Images/Videos (*.png *.jpg *.jpeg *.bmp *.mp4 *.mov *.avi)")
+            if not base_path:
+                return
+
+        # Reset and load base image
+        try:
+            raw = load_first_frame(base_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Open Project", f"Failed to load base image:\n{e}")
+            return
+
+        self.canvas.set_base_image(raw)
+        self.canvas._base_image_path = base_path
+
+        # Restore settings
+        self.spn_fps.setValue(project.get("fps", 16))
+        self.spn_total_frames.setValue(project.get("total_frames", 81))
+        if hasattr(self, 'txt_prompt'):
+            self.txt_prompt.setPlainText(project.get("prompt", ""))
+
+        # Restore layers — rebuild keyframes and path visuals only
+        # (polygons/sprites need to be redrawn manually for now,
+        #  but keyframe positions, easing, and motion data are preserved)
+        for layer_data in project.get("layers", []):
+            if layer_data.get("is_external"):
+                ext_path = layer_data.get("external_sprite_path", "")
+                if not os.path.exists(ext_path):
+                    continue
+                sprite_bgr = cv2.imread(ext_path, cv2.IMREAD_COLOR)
+                if sprite_bgr is None:
+                    continue
+
+                alpha_mask = None
+                alpha_path = layer_data.get("alpha_mask_path", "")
+                if alpha_path and os.path.exists(alpha_path):
+                    alpha_mask = cv2.imread(alpha_path, cv2.IMREAD_GRAYSCALE)
+
+                if layer_data.get("sprite_already_processed"):
+                    # Sprite is already canvas-sized — load directly without re-processing
+                    name = layer_data.get("name", f"ext_{len(self.canvas.layers)}")
+                    polygon_xy = np.array(layer_data["polygon_xy"], dtype=np.float32) if layer_data.get("polygon_xy") else None
+
+                    L = Layer(name=name, source_bgr=sprite_bgr, is_external=True,
+                              polygon_xy=polygon_xy, alpha_mask=alpha_mask)
+
+                    # Build RGBA pixmap directly from source + alpha
+                    H, W = sprite_bgr.shape[:2]
+                    rgb = cv2.cvtColor(sprite_bgr, cv2.COLOR_BGR2RGB)
+                    rgba = np.zeros((H, W, 4), dtype=np.uint8)
+                    rgba[:, :, :3] = rgb
+                    if alpha_mask is not None:
+                        rgba[:, :, 3] = alpha_mask
+                    elif polygon_xy is not None:
+                        poly_mask = np.zeros((H, W), dtype=np.uint8)
+                        cv2.fillPoly(poly_mask, [polygon_xy.astype(np.int32)], 255)
+                        rgba[:, :, 3] = poly_mask
+                    else:
+                        rgba[:, :, 3] = 255
+
+                    pm = np_rgba_to_qpixmap(rgba)
+
+                    # Color — restore from saved or use default
+                    if layer_data.get("color"):
+                        c = layer_data["color"]
+                        L.color = QColor(c[0], c[1], c[2])
+                    else:
+                        L.color = LAYER_COLORS[len(self.canvas.layers) % len(LAYER_COLORS)]
+
+                    # Create NotifyingPixmapItem with sync callback (not plain QGraphicsPixmapItem)
+                    def on_change():
+                        if L.keyframes:
+                            self.canvas._ensure_preview_line(L)
+                            self.canvas.sync_item_to_active_keyframe()
+                        self.canvas._relayout_handles(L)
+
+                    item = NotifyingPixmapItem(pm, on_change_cb=on_change)
+                    z_val = layer_data.get("item_z", 100 + len(self.canvas.layers))
+                    item.setZValue(z_val)
+                    item.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+
+                    # Restore origin
+                    if layer_data.get("origin_local_xy"):
+                        origin = np.array(layer_data["origin_local_xy"], dtype=np.float32)
+                        L.origin_local_xy = origin
+                        item.setTransformOriginPoint(QPointF(origin[0], origin[1]))
+
+                    # Restore position, rotation, scale
+                    if layer_data.get("item_pos"):
+                        item.setPos(QPointF(layer_data["item_pos"][0], layer_data["item_pos"][1]))
+                    if "item_rotation" in layer_data:
+                        item.setRotation(layer_data["item_rotation"])
+                    if "item_scale" in layer_data:
+                        item.setScale(layer_data["item_scale"])
+
+                    self.canvas.scene.addItem(item)
+                    L.pixmap_item = item
+
+                    # Add scale/rotate handles
+                    self.canvas._create_handles_for_layer(L)
+
+                    self.canvas.layers.append(L)
+                    self.canvas.current_layer = L
+                else:
+                    # Old-style: re-process through add_external_sprite_layer
+                    L = self.canvas.add_external_sprite_layer(sprite_bgr)
+                    if L and alpha_mask is not None:
+                        L.alpha_mask = alpha_mask
+            else:
+                polygon_xy = np.array(layer_data["polygon_xy"], dtype=np.float32) if layer_data.get("polygon_xy") else None
+                if polygon_xy is None:
+                    continue
+                # Simulate polygon drawing by directly creating the layer
+                L = self.canvas.finish_polygon_from_points(polygon_xy)
+                if L is None:
+                    continue
+
+            # Restore origin
+            if layer_data.get("origin_local_xy") and L.origin_local_xy is not None:
+                L.origin_local_xy = np.array(layer_data["origin_local_xy"], dtype=np.float32)
+
+            # Restore keyframes
+            L.keyframes.clear()
+            for kf_data in layer_data.get("keyframes", []):
+                kf = Keyframe(
+                    pos=np.array(kf_data["pos"], dtype=np.float32),
+                    rot_deg=kf_data["rot_deg"],
+                    scale=kf_data["scale"],
+                    hue_deg=kf_data.get("hue_deg", 0.0),
+                    easing=kf_data.get("easing", "linear"),
+                )
+                L.keyframes.append(kf)
+
+            # Rebuild visual elements
+            self.canvas._update_path_lines(L)
+            self.canvas._update_keyframe_markers(L)
+
+            # Snap item to last keyframe (with sync guard)
+            if L.keyframes:
+                self.canvas._syncing = True
+                try:
+                    self.canvas.revert_to_last_keyframe(L)
+                finally:
+                    self.canvas._syncing = False
+
+        self.canvas.current_layer = self.canvas.layers[-1] if self.canvas.layers else None
+        self.status_label.setText(f"Project loaded: {os.path.basename(path)}")
+        self._set_instruction("Project loaded! Continue editing, play demo, or export.")
+
+    def on_new(self):
         self.canvas.scene.clear()
         self.canvas.layers.clear()
         self.canvas.current_layer = None
@@ -2033,7 +2492,15 @@ class MainWindow(QMainWindow):
         self.on_select_base()
 
     def on_save(self):
-        if self._block_if_pending_segment("saving"):
+        # Check that at least one layer has 2+ keyframes
+        has_animation = False
+        if self.canvas.layers:
+            for L in self.canvas.layers:
+                if len(L.keyframes) >= 2:
+                    has_animation = True
+                    break
+        if not has_animation:
+            QMessageBox.information(self, "Export", "Need at least 2 keyframes to export. Click '➕ Add Keyframe' to add more.")
             return
         if self.canvas.base_bgr is None or not self.canvas.layers:
             QMessageBox.information(self, "Save", "Load an image and add at least one polygon/sprite first.")
@@ -2094,6 +2561,7 @@ class MainWindow(QMainWindow):
 
         # Output paths
         first_frame_path = os.path.join(final_dir, "first_frame.png")
+        last_frame_path  = os.path.join(final_dir, "last_frame.png")
         motion_path      = os.path.join(final_dir, "motion_signal.mp4")
         mask_path        = os.path.join(final_dir, "mask.mp4")
         base_title       = subdir_name  # for optional numpy save below
@@ -2136,6 +2604,12 @@ class MainWindow(QMainWindow):
                 u = np.linspace(0.0, float(segs), T, dtype=np.float32)
                 seg_idx = np.minimum(np.floor(u).astype(int), segs - 1)
                 t = u - seg_idx
+                # Apply per-segment easing
+                for s in range(segs):
+                    mask = seg_idx == s
+                    if mask.any():
+                        seg_easing = keyframes[s + 1].easing if hasattr(keyframes[s + 1], 'easing') else "linear"
+                        t[mask] = apply_easing(t[mask], seg_easing)
                 k0 = np.array([[keyframes[i].pos[0], keyframes[i].pos[1], keyframes[i].scale, keyframes[i].rot_deg] for i in seg_idx], dtype=np.float32)
                 k1 = np.array([[keyframes[i+1].pos[0], keyframes[i+1].pos[1], keyframes[i+1].scale, keyframes[i+1].rot_deg] for i in seg_idx], dtype=np.float32)
                 pos0 = k0[:, :2]; pos1 = k1[:, :2]
@@ -2202,9 +2676,13 @@ class MainWindow(QMainWindow):
 
         # --- Actual saving ---
         try:
-            # first_frame.png (copy of the base image used for saving)
+            # first_frame.png
             first_frame = frames_out[0]
             cv2.imwrite(first_frame_path, first_frame)
+
+            # last_frame.png
+            last_frame = frames_out[-1]
+            cv2.imwrite(last_frame_path, last_frame)
 
             # motion_signal.mp4 = composited warped video
             save_video_mp4(frames_out, motion_path, fps=fps)
