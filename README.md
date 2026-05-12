@@ -1,7 +1,7 @@
 <h1 align="center">Time-to-Move</h1>
 <h2 align="center">Training-Free Motion-Controlled Video Generation via Dual-Clock Denoising</h2>
 <p align="center">
-  <a href="https://www.linkedin.com/in/assaf-singer/">Assaf Singer</a><sup>†</sup> ·
+  <a href="https://assafsinger94.github.io/">Assaf Singer</a><sup>†</sup> ·
   <a href="https://rotsteinnoam.github.io/">Noam Rotstein</a><sup>†</sup> ·
   <a href="https://www.linkedin.com/in/amir-mann-a890bb276/">Amir Mann</a> ·
   <a href="https://ron.cs.technion.ac.il/">Ron Kimmel</a> ·
